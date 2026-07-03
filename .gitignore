@@ -1,0 +1,9 @@
+/build/
+/install/
+/log/
+/weights/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.engine
