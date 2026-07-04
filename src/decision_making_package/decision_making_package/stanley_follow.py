@@ -51,6 +51,7 @@ class LaneFollow(Node):
         self.declare_parameter('min_smooth_speed', 0.45)
         self.declare_parameter('lane_width_px', 250.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
+        self.declare_parameter('narrow_both_gap_px', 200.0)   # both 인식됐지만 간격이 이보다 좁으면 단일차선 재판정
         self.declare_parameter('min_lane_pixels', 30)
         self.declare_parameter('use_history_lane_fallback', True)
         self.declare_parameter('lane_history_size', 10)
@@ -83,6 +84,7 @@ class LaneFollow(Node):
         self.min_smooth_speed = float(self.get_parameter('min_smooth_speed').value)
         self.lane_width_px = float(self.get_parameter('lane_width_px').value)
         self.min_lane_overlap_px = float(self.get_parameter('min_lane_overlap_px').value)
+        self.narrow_both_gap_px = float(self.get_parameter('narrow_both_gap_px').value)
         self.min_lane_pixels = int(self.get_parameter('min_lane_pixels').value)
         self.use_history_lane_fallback = bool(self.get_parameter('use_history_lane_fallback').value)
         self.lane_history_size = int(self.get_parameter('lane_history_size').value)
@@ -152,6 +154,8 @@ class LaneFollow(Node):
         self.single_left_score = float('inf')
         self.single_right_score = float('inf')
         self.single_lane_slope = float('nan')
+        self.narrow_both_active = False
+        self.narrow_both_gap = 0.0
 
         self.timer = None
         if start_timer:
@@ -364,6 +368,7 @@ class LaneFollow(Node):
         self.cmd_vel_pub.publish(msg)
 
     def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
+        self.narrow_both_active = False
         y = img.shape[0]
         histogram = np.sum(img[y // 2:, :], axis=0)
         midpoint = int(histogram.shape[0] / 2)
@@ -443,9 +448,39 @@ class LaneFollow(Node):
                 lfit, rfit = fit_b, fit_a
 
             lane_width = self.fit_distance(lfit, rfit, y)
-            if lane_width >= self.min_lane_overlap_px:
+            if lane_width >= self.narrow_both_gap_px:
                 self.last_lane_status = 'both'
                 self.update_both_lane_track(lfit, rfit, y, img.shape[1])
+            elif lane_width >= self.min_lane_overlap_px:
+                # both로 잡혔지만 간격이 너무 좁음 -> 기울기로 어느 쪽 차선인지 1차 판단 후,
+                # 더 신뢰도 높은(픽셀 수 많은) 후보의 기울기로 "진짜" 좌/우를 재판정
+                self.narrow_both_active = True
+                self.narrow_both_gap = lane_width
+                majority = max(candidates, key=lambda item: item[1])[0]
+                slope = float(np.asarray(majority, dtype=float)[0])
+
+                if slope > 0.0:
+                    side = 'right'
+                    candidate = lfit
+                elif slope < 0.0:
+                    side = 'left'
+                    candidate = rfit
+                else:
+                    side = None
+
+                if side is None:
+                    self.last_lane_status = 'single_ambiguous'
+                    if self.prev_lfit is not None and self.prev_rfit is not None:
+                        lfit = self.prev_lfit.copy()
+                        rfit = self.prev_rfit.copy()
+                    else:
+                        lane_center = img.shape[1] / 2.0
+                        half_lane = self.lane_width_px / 2.0
+                        lfit = np.array([0.0, lane_center - half_lane])
+                        rfit = np.array([0.0, lane_center + half_lane])
+                else:
+                    lfit, rfit = self.update_single_lane_track(candidate, side)
+                    self.last_lane_status = f'narrow_both_{side}'
             else:
                 candidate = max(candidates, key=lambda item: item[1])[0]
                 side, left_score, right_score = self.classify_single_lane(candidate, y)
@@ -565,10 +600,14 @@ class LaneFollow(Node):
         text2 = f'err: {self.error:.1f} px / v: {self.cmd_speed:.2f}'
         text3 = f'lane: {self.last_lane_status}'
         text5 = f'box_off: {self.box_offset_px:.1f}'
-        cv.putText(result, text1, (30, 40), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv.LINE_AA)
+        cv.putText(result, text1, (30, 40), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
         cv.putText(result, text2, (30, 110), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv.LINE_AA)
         cv.putText(result, text3, (30, 145), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv.LINE_AA)
         cv.putText(result, text5, (30, 180), cv.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2, cv.LINE_AA)
+
+        if self.narrow_both_active:
+            text7 = f'narrow_both! gap={self.narrow_both_gap:.1f}px < {self.narrow_both_gap_px:.0f}px'
+            cv.putText(result, text7, (30, 250), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
 
         return result
 
