@@ -24,7 +24,7 @@ class LaneFollow(Node):
         self.cv_bridge = CvBridge()
 
         # ---- 박스 회피 파라미터 ----
-        self.declare_parameter('box_avoid_enable', True)
+        self.declare_parameter('box_avoid_enable', False)
         self.declare_parameter('box_offset_ratio', 0.20)      # 차선폭 대비 오프셋 비율
         self.declare_parameter('box_react_dist_m', 0.6)       # 이 거리부터 반응 시작
         self.declare_parameter('box_closest_dist_m', 0.35)    # 이 거리에서 오프셋 최대
@@ -35,8 +35,11 @@ class LaneFollow(Node):
 
         self.declare_parameter('img_width', 640)
         self.declare_parameter('img_height', 480)
-        self.declare_parameter('white_lower', [0, 0, 180])
-        self.declare_parameter('white_upper', [180, 40, 255])
+        self.declare_parameter('white_lower', [0, 0, 190])
+        self.declare_parameter('white_upper', [180, 20, 255])
+        self.declare_parameter('tophat_enable', True)
+        self.declare_parameter('tophat_kernel_size', 31)
+        self.declare_parameter('tophat_thresh', 30)
 
         self.declare_parameter('debug_view', True)
         self.declare_parameter('process_hz', 30.0)
@@ -64,6 +67,12 @@ class LaneFollow(Node):
         self.img_height = int(self.get_parameter('img_height').value)
         self.white_lower = np.array(self.get_parameter('white_lower').value, dtype=np.uint8)
         self.white_upper = np.array(self.get_parameter('white_upper').value, dtype=np.uint8)
+        self.tophat_enable = bool(self.get_parameter('tophat_enable').value)
+        self.tophat_kernel_size = int(self.get_parameter('tophat_kernel_size').value)
+        self.tophat_thresh = int(self.get_parameter('tophat_thresh').value)
+        self.tophat_kernel = cv.getStructuringElement(
+            cv.MORPH_ELLIPSE, (self.tophat_kernel_size, self.tophat_kernel_size)
+        )
         self.debug_view = bool(self.get_parameter('debug_view').value)
         self.process_hz = float(self.get_parameter('process_hz').value)
         self.steer_k = float(self.get_parameter('steer_k').value)
@@ -113,7 +122,7 @@ class LaneFollow(Node):
         self.debug_publisher1 = self.create_publisher(Image, '/debugging_image1', 10)
         self.debug_publisher2 = self.create_publisher(Image, '/debugging_image2', 10)
 
-        self.src_points = np.float32([[119.0, 233.0], [492.0, 215.0], [13.0, 304.0], [622.0, 326.0]])
+        self.src_points = np.float32([[133.5, 224.0], [506.5, 224.0], [15.5, 315.0], [624.5, 315.0]])
         self.dst_points = np.float32([[160.0, 0.0], [480.0, 0.0], [160.0, 479.0], [480.0, 479.0]])
 
         self.warp_mat = cv.getPerspectiveTransform(self.src_points, self.dst_points)
@@ -229,6 +238,12 @@ class LaneFollow(Node):
         gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
         _, binary = cv.threshold(gray, 100, 255, cv.THRESH_BINARY)
         return binary
+
+    def tophat_filter(self, img):
+        gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        tophat = cv.morphologyEx(gray, cv.MORPH_TOPHAT, self.tophat_kernel)
+        _, lane_mask = cv.threshold(tophat, self.tophat_thresh, 255, cv.THRESH_BINARY)
+        return lane_mask
 
     def update_lane_history(self, lfit, rfit):
         self.left_fit_history.append(np.array(lfit, dtype=float))
@@ -568,7 +583,14 @@ class LaneFollow(Node):
         self.roi_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(g_filtered, encoding='bgr8'))
 
         self.white_img = self.white_color_filter_hsv(g_filtered)
-        self.filtered_img = self.binary_filter(self.white_img)
+        hsv_binary = self.binary_filter(self.white_img)
+
+        if self.tophat_enable:
+            tophat_mask = self.tophat_filter(g_filtered)
+            self.filtered_img = cv.bitwise_and(hsv_binary, tophat_mask)
+        else:
+            self.filtered_img = hsv_binary
+
         self.binary_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.filtered_img, encoding='mono8'))
 
         lfit, rfit = self.sliding_window(self.filtered_img)
