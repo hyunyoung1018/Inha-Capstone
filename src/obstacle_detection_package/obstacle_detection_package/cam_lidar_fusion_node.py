@@ -26,7 +26,7 @@ CAMERA_FOV_DEG   = 66.74
 TARGET_CLASSES   = ['Cone', 'Person', 'Box', 'Car']
 TUNNEL_CLASS     = 'Tunnel'
 
-# --- 씨앗 트래킹 (모든 클래스 공통) ---
+# --- 씨앗 트래킹 (Person, Car 전용) ---
 SEED_RADIUS      = 0.35     # 씨앗 근처 탐색 반경 [m]
 LOST_FRAMES      = 10       # Lost 판정 프레임 (20Hz * 10 = 0.5초)
 MIN_POINTS       = 4        # 클러스터 최소 점 개수
@@ -37,7 +37,7 @@ MAX_RANGE        = 2.0      # 이 거리 밖 장애물 무시 [m]
 FORWARD_MIN      = 0.1      # 이 값보다 뒤(작으면) 무시 [m] (후방/측면 제거)
 
 # --- 거리 측정 ---
-SCAN_WINDOW      = 5        # YOLO 각도 주변 스캔 탐색 폭
+SCAN_WINDOW      = 5        # YOLO 각도 주변 스캔 탐색 폭 (Person, Car 전용)
 
 # --- 터널 벽 인식 (트래킹 없음, bbox 각도 범위 안 2클러스터) ---
 TUNNEL_ANGLE_PAD_DEG = 3.0   # bbox 각도 범위 좌우 여유 [deg]
@@ -90,7 +90,7 @@ class CameraLidarFusionNode(Node):
             self.marker_pub = self.create_publisher(MarkerArray, PUB_MARKER_TOPIC, 10)
 
         self.create_timer(1.0 / RATE_HZ, self.fuse_and_publish)
-        self.get_logger().info('Camera-LiDAR Fusion 시작 (씨앗 트래킹 + 터널 벽 2클러스터)')
+        self.get_logger().info('Camera-LiDAR Fusion 시작')
 
     def scan_callback(self, msg: LaserScan):
         self.latest_scan = msg
@@ -116,6 +116,24 @@ class CameraLidarFusionNode(Node):
         age = (self.get_clock().now() - self.latest_det_time).nanoseconds * 1e-9
         detections = self.latest_detections if age < YOLO_TIMEOUT else []
 
+        # ==============================================================
+        # [추가됨] 차량(Car)이 보이면 콘(Cone) 데이터 무시
+        # ==============================================================
+        car_seen = any(cls == 'Car' for cls, cx, bw in detections)
+        if car_seen:
+            # Cone 클래스를 제외한 나머지 detection만 남김
+            detections = [det for det in detections if det[0] != 'Cone']
+        # ==============================================================
+
+        # ==============================================================
+        # [기존 로직] 콘(Cone)이 보이면 박스(Box) 데이터 무시
+        # ==============================================================
+        cone_seen = any(cls == 'Cone' for cls, cx, bw in detections)
+        if cone_seen:
+            # Box 클래스를 제외한 나머지 detection만 남김
+            detections = [det for det in detections if det[0] != 'Box']
+        # ==============================================================
+
         # 터널 감지: YOLO Tunnel bbox 찾기
         tunnel_det = self._find_tunnel(detections)  # (cx, bw) or None
         tunnel_on = tunnel_det is not None
@@ -139,15 +157,17 @@ class CameraLidarFusionNode(Node):
             tr.source = 'fusion'
             matched.add(tr.id)
 
-        # 3) YOLO가 못 본 트래커 → 씨앗 근처 클러스터로 추적 유지
+        # 3) YOLO가 못 본 트래커 → 씨앗 근처 클러스터로 추적 유지 (Person, Car 한정)
         survivors = []
         for tr in self.trackers:
-            # 터널 중이면 Cone/Box 트래커 즉시 폐기
-            if tunnel_on and tr.class_name in ('Cone', 'Box'):
-                continue
             if tr.id in matched:
                 survivors.append(tr)
                 continue
+            
+            # YOLO에서 놓쳤을 때, Box는 라이다 트래킹을 하지 않고 즉시 폐기
+            if tr.class_name == 'Box':
+                continue
+
             new_pos = self._find_cluster_near(scan, tr.pos, SEED_RADIUS)
             if new_pos is not None:
                 if new_pos[0] <= FORWARD_MIN:
@@ -195,7 +215,6 @@ class CameraLidarFusionNode(Node):
 
     # ================= 터널 벽 인식 =================
     def _find_tunnel(self, detections):
-        """YOLO 검출 중 Tunnel → (cx, bw) or None (가장 큰 것)"""
         best = None
         for cls, cx, bw in detections:
             if cls == TUNNEL_CLASS:
@@ -204,8 +223,6 @@ class CameraLidarFusionNode(Node):
         return best
 
     def _detect_tunnel_walls(self, tunnel_det, scan):
-        """Tunnel bbox 각도 범위 안 라이다 점을 클러스터링해서
-        가장 큰 2개 덩어리를 좌/우 벽으로 인식. 트래킹 없음."""
         cx, bw = tunnel_det
         x_left = cx - bw / 2.0
         x_right = cx + bw / 2.0
@@ -218,7 +235,6 @@ class CameraLidarFusionNode(Node):
         ainc = scan.angle_increment
         rmin = scan.range_min
 
-        # 각도 범위 안 유효 점을 각도 순으로 (i, r, angle) 수집
         pts = []
         for i, r in enumerate(scan.ranges):
             angle = amin + i * ainc
@@ -231,7 +247,6 @@ class CameraLidarFusionNode(Node):
         if len(pts) < TUNNEL_MIN_POINTS:
             return []
 
-        # 인접 점 거리 점프로 클러스터 분할 (브리징 허용)
         clusters = []
         cur = [pts[0]]
         gap = 0
@@ -246,12 +261,10 @@ class CameraLidarFusionNode(Node):
                 cur.append(pts[k])
         clusters.append(cur)
 
-        # 점 개수 충분한 클러스터만
         clusters = [c for c in clusters if len(c) >= TUNNEL_MIN_POINTS]
         if not clusters:
             return []
 
-        # 각 클러스터 대표 위치(평균) 계산
         reps = []
         for c in clusters:
             xs = [p[1] * math.cos(p[2]) for p in c]
@@ -260,17 +273,14 @@ class CameraLidarFusionNode(Node):
             fy = sum(ys) / len(ys)
             reps.append((fx, fy, len(c)))
 
-        # 점 많은 순 상위 2개를 벽으로
         reps.sort(key=lambda p: p[2], reverse=True)
         top = reps[:2]
 
         walls = []
         if len(top) == 2:
-            # y가 큰 쪽이 왼쪽(+), 작은 쪽이 오른쪽(-)
             top.sort(key=lambda p: p[1], reverse=True)
             sides = ['left', 'right']
         else:
-            # 하나만 잡히면 y 부호로 판단
             sides = ['left' if top[0][1] >= 0 else 'right']
 
         for (fx, fy, _n), side in zip(top, sides):
@@ -293,12 +303,46 @@ class CameraLidarFusionNode(Node):
             # 터널 중이면 Cone/Box 무시 (Car/Person만)
             if tunnel_on and cls in ('Cone', 'Box'):
                 continue
-            angle = -(cx - (IMG_W / 2.0)) * (self.camera_fov_rad / IMG_W)
-            distance = self.get_distance_from_scan(angle, scan)
-            if distance is not None and distance <= MAX_RANGE:
-                result.append((cls, (distance * math.cos(angle),
-                                     distance * math.sin(angle))))
+            
+            if cls in ('Cone', 'Box'):
+                # Cone, Box: 박스 영역 안의 라이다 덩어리를 묶어서 하나의 좌표로 계산
+                pos = self._get_cluster_from_bbox(cx, bw, scan)
+                if pos is not None and math.hypot(*pos) <= MAX_RANGE:
+                    result.append((cls, pos))
+            else:
+                # Person, Car: 기존 방식 (바운딩 박스 중심 각도 주변 탐색)
+                angle = -(cx - (IMG_W / 2.0)) * (self.camera_fov_rad / IMG_W)
+                distance = self.get_distance_from_scan(angle, scan)
+                if distance is not None and distance <= MAX_RANGE:
+                    result.append((cls, (distance * math.cos(angle),
+                                         distance * math.sin(angle))))
         return result
+
+    def _get_cluster_from_bbox(self, cx, bw, scan):
+        x_left = cx - bw / 2.0
+        x_right = cx + bw / 2.0
+        ang_a = -(x_left - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
+        ang_b = -(x_right - IMG_W / 2.0) * (self.camera_fov_rad / IMG_W)
+        ang_lo = min(ang_a, ang_b)
+        ang_hi = max(ang_a, ang_b)
+
+        amin = scan.angle_min
+        ainc = scan.angle_increment
+        rmin = scan.range_min
+        rmax = min(scan.range_max, MAX_RANGE)
+
+        xs, ys = [], []
+        for i, r in enumerate(scan.ranges):
+            if not (math.isfinite(r) and rmin < r < rmax):
+                continue
+            angle = amin + i * ainc
+            if ang_lo <= angle <= ang_hi:
+                xs.append(r * math.cos(angle))
+                ys.append(r * math.sin(angle))
+
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     def _match_tracker(self, cls, pos):
         best, best_d = None, MATCH_DIST
@@ -367,7 +411,7 @@ class CameraLidarFusionNode(Node):
             cyl.pose.orientation.w = 1.0
             cyl.scale.x = 0.3; cyl.scale.y = 0.3; cyl.scale.z = 1.0
             if is_wall:
-                cyl.color.r = 0.0; cyl.color.g = 0.4; cyl.color.b = 1.0  # 파랑: 벽
+                cyl.color.r = 0.0; cyl.color.g = 0.4; cyl.color.b = 1.0
             else:
                 cyl.color.r = 1.0
                 cyl.color.g = 0.5 if is_lidar else 0.0

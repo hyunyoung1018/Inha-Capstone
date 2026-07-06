@@ -3,7 +3,6 @@
 
 import json
 import math
-from collections import deque
 
 import cv2 as cv
 from cv_bridge import CvBridge
@@ -41,7 +40,6 @@ class LaneFollow(Node):
         self.declare_parameter('tophat_kernel_size', 31)
         self.declare_parameter('tophat_thresh', 30)
 
-        self.declare_parameter('debug_view', True)
         self.declare_parameter('process_hz', 30.0)
         self.declare_parameter('steer_k', 0.002)
         self.declare_parameter('yaw_k', 1.0)
@@ -51,18 +49,10 @@ class LaneFollow(Node):
         self.declare_parameter('min_smooth_speed', 0.45)
         self.declare_parameter('lane_width_px', 250.0)
         self.declare_parameter('min_lane_overlap_px', 50.0)
-        self.declare_parameter('narrow_both_gap_px', 200.0)   # both 인식됐지만 간격이 이보다 좁으면 단일차선 재판정
+        self.declare_parameter('narrow_both_gap_px', 220.0)   # both 인식됐지만 간격이 이보다 좁으면 단일차선 재판정
         self.declare_parameter('min_lane_pixels', 30)
-        self.declare_parameter('use_history_lane_fallback', True)
-        self.declare_parameter('lane_history_size', 10)
-        self.declare_parameter('min_lane_history_samples', 3)
-        self.declare_parameter('history_compare_y_ratio', 0.85)
         self.declare_parameter('single_lane_track_alpha', 0.80)
-        self.declare_parameter('side_match_gate_ratio', 0.60)
-        self.declare_parameter('side_match_margin_ratio', 0.12)
         self.declare_parameter('lane_width_update_alpha', 0.10)
-        self.declare_parameter('side_switch_frames', 3)
-        self.declare_parameter('side_hold_gate_ratio', 0.85)
 
         self.img_width = int(self.get_parameter('img_width').value)
         self.img_height = int(self.get_parameter('img_height').value)
@@ -74,7 +64,6 @@ class LaneFollow(Node):
         self.tophat_kernel = cv.getStructuringElement(
             cv.MORPH_ELLIPSE, (self.tophat_kernel_size, self.tophat_kernel_size)
         )
-        self.debug_view = bool(self.get_parameter('debug_view').value)
         self.process_hz = float(self.get_parameter('process_hz').value)
         self.steer_k = float(self.get_parameter('steer_k').value)
         self.yaw_k = float(self.get_parameter('yaw_k').value)
@@ -86,16 +75,8 @@ class LaneFollow(Node):
         self.min_lane_overlap_px = float(self.get_parameter('min_lane_overlap_px').value)
         self.narrow_both_gap_px = float(self.get_parameter('narrow_both_gap_px').value)
         self.min_lane_pixels = int(self.get_parameter('min_lane_pixels').value)
-        self.use_history_lane_fallback = bool(self.get_parameter('use_history_lane_fallback').value)
-        self.lane_history_size = int(self.get_parameter('lane_history_size').value)
-        self.min_lane_history_samples = int(self.get_parameter('min_lane_history_samples').value)
-        self.history_compare_y_ratio = float(self.get_parameter('history_compare_y_ratio').value)
         self.single_lane_track_alpha = float(self.get_parameter('single_lane_track_alpha').value)
-        self.side_match_gate_ratio = float(self.get_parameter('side_match_gate_ratio').value)
-        self.side_match_margin_ratio = float(self.get_parameter('side_match_margin_ratio').value)
         self.lane_width_update_alpha = float(self.get_parameter('lane_width_update_alpha').value)
-        self.side_switch_frames = max(1, int(self.get_parameter('side_switch_frames').value))
-        self.side_hold_gate_ratio = float(self.get_parameter('side_hold_gate_ratio').value)
 
         self.box_avoid_enable = bool(self.get_parameter('box_avoid_enable').value)
         self.box_offset_ratio = float(self.get_parameter('box_offset_ratio').value)
@@ -106,8 +87,17 @@ class LaneFollow(Node):
         self.box_curve_damp = float(self.get_parameter('box_curve_damp').value)
         self.box_curve_min_scale = float(self.get_parameter('box_curve_min_scale').value)
 
+        self.latest_behavior_phase = 'NORMAL'
+        self.behavior_phase = 'NORMAL'
+        self.car_follow_latched = False
+        self.car_follow_hold_sec = 3.0
+        self.car_follow_last_seen_sec = None
+
         self.fused_sub = self.create_subscription(
             String, '/obstacles/fused', self.fused_cb, qos_profile_sensor_data
+        )
+        self.phase_sub = self.create_subscription(
+            String, '/behavior/phase', self.phase_cb, 10
         )
         self.box_offset_px = 0.0
         self.box_target_offset = 0.0
@@ -145,8 +135,6 @@ class LaneFollow(Node):
         self.cmd_speed = 0.0
         self.prev_lfit = None
         self.prev_rfit = None
-        self.left_fit_history = deque(maxlen=self.lane_history_size)
-        self.right_fit_history = deque(maxlen=self.lane_history_size)
         self.last_lane_status = 'none'
         self.last_observed_side = None
         self.pending_single_side = None
@@ -156,6 +144,8 @@ class LaneFollow(Node):
         self.single_lane_slope = float('nan')
         self.narrow_both_active = False
         self.narrow_both_gap = 0.0
+        self.car_follow_lane_debug = 'off'
+        self.car_follow_single_angle_deg = float('nan')
 
         self.timer = None
         if start_timer:
@@ -188,6 +178,34 @@ class LaneFollow(Node):
         except json.JSONDecodeError:
             return
         self._update_box_offset(obstacles)
+
+    def phase_cb(self, msg):
+        self.latest_behavior_phase = msg.data
+        if msg.data == 'CAR_FOLLOW':
+            self.car_follow_latched = True
+            self.car_follow_last_seen_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.behavior_phase = 'CAR_FOLLOW'
+            return
+
+        self._update_car_follow_hold()
+
+    def _update_car_follow_hold(self):
+        if not self.car_follow_latched:
+            self.behavior_phase = self.latest_behavior_phase
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self.car_follow_last_seen_sec is None:
+            self.car_follow_last_seen_sec = now_sec
+
+        if now_sec - self.car_follow_last_seen_sec >= self.car_follow_hold_sec:
+            self.car_follow_latched = False
+            if self.latest_behavior_phase == 'CAR_FOLLOW':
+                self.behavior_phase = 'NORMAL'
+            else:
+                self.behavior_phase = self.latest_behavior_phase
+        else:
+            self.behavior_phase = 'CAR_FOLLOW'
 
     def _update_box_offset(self, obstacles):
         if not self.box_avoid_enable:
@@ -249,10 +267,6 @@ class LaneFollow(Node):
         _, lane_mask = cv.threshold(tophat, self.tophat_thresh, 255, cv.THRESH_BINARY)
         return lane_mask
 
-    def update_lane_history(self, lfit, rfit):
-        self.left_fit_history.append(np.array(lfit, dtype=float))
-        self.right_fit_history.append(np.array(rfit, dtype=float))
-
     @staticmethod
     def fit_x(fit, y_values):
         y_values = np.asarray(y_values, dtype=float)
@@ -262,6 +276,10 @@ class LaneFollow(Node):
         y_values = (img_h - 1) * np.array([0.15, 0.35, 0.55, 0.75, 0.95])
         distance = np.abs(self.fit_x(fit_a, y_values) - self.fit_x(fit_b, y_values))
         return float(np.median(distance))
+
+    @staticmethod
+    def fit_angle_deg(fit):
+        return math.degrees(math.atan(float(fit[0])))
 
     def classify_single_lane(self, fit, img_h):
         del img_h
@@ -319,7 +337,6 @@ class LaneFollow(Node):
 
         self.prev_lfit = np.asarray(lfit, dtype=float).copy()
         self.prev_rfit = np.asarray(rfit, dtype=float).copy()
-        self.update_lane_history(lfit, rfit)
         self.last_observed_side = None
         self.pending_single_side = None
         self.pending_single_count = 0
@@ -368,7 +385,11 @@ class LaneFollow(Node):
         self.cmd_vel_pub.publish(msg)
 
     def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
+        self._update_car_follow_hold()
         self.narrow_both_active = False
+        self.car_follow_lane_debug = 'off'
+        self.car_follow_single_angle_deg = float('nan')
+        car_follow = self.behavior_phase == 'CAR_FOLLOW'
         y = img.shape[0]
         histogram = np.sum(img[y // 2:, :], axis=0)
         midpoint = int(histogram.shape[0] / 2)
@@ -437,6 +458,16 @@ class LaneFollow(Node):
             if duplicate_distance < self.min_lane_overlap_px:
                 candidates = [max(candidates, key=lambda item: item[1])]
 
+        if car_follow and len(candidates) == 1:
+            candidate_fit = np.asarray(candidates[0][0], dtype=float)
+            angle_deg = self.fit_angle_deg(candidate_fit)
+            self.car_follow_single_angle_deg = angle_deg
+            if angle_deg >= 20.0:
+                self.car_follow_lane_debug = f'drop single right {angle_deg:.1f}deg'
+                candidates = []
+            else:
+                self.car_follow_lane_debug = f'keep single {angle_deg:.1f}deg'
+
         if len(candidates) == 2:
             fit_a = np.asarray(candidates[0][0], dtype=float)
             fit_b = np.asarray(candidates[1][0], dtype=float)
@@ -449,13 +480,20 @@ class LaneFollow(Node):
 
             lane_width = self.fit_distance(lfit, rfit, y)
             if lane_width >= self.narrow_both_gap_px:
-                self.last_lane_status = 'both'
-                self.update_both_lane_track(lfit, rfit, y, img.shape[1])
+                if car_follow:
+                    lfit, rfit = self.update_single_lane_track(rfit, 'right')
+                    self.last_lane_status = 'car_follow_right_only'
+                    self.car_follow_lane_debug = f'force right gap={lane_width:.1f}px'
+                else:
+                    self.last_lane_status = 'both'
+                    self.update_both_lane_track(lfit, rfit, y, img.shape[1])
             elif lane_width >= self.min_lane_overlap_px:
                 # both로 잡혔지만 간격이 너무 좁음 -> 기울기로 어느 쪽 차선인지 1차 판단 후,
                 # 더 신뢰도 높은(픽셀 수 많은) 후보의 기울기로 "진짜" 좌/우를 재판정
                 self.narrow_both_active = True
                 self.narrow_both_gap = lane_width
+                if car_follow:
+                    self.car_follow_lane_debug = f'narrow keep gap={lane_width:.1f}px'
                 majority = max(candidates, key=lambda item: item[1])[0]
                 slope = float(np.asarray(majority, dtype=float)[0])
 
@@ -608,6 +646,20 @@ class LaneFollow(Node):
         if self.narrow_both_active:
             text7 = f'narrow_both! gap={self.narrow_both_gap:.1f}px < {self.narrow_both_gap_px:.0f}px'
             cv.putText(result, text7, (30, 250), cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv.LINE_AA)
+
+        text8 = f'phase: {self.behavior_phase}'
+        if self.car_follow_latched:
+            text8 += ' (latched)'
+        cv.putText(
+            result, text8, (30, 285), cv.FONT_HERSHEY_SIMPLEX, 0.65,
+            (200, 200, 200), 2, cv.LINE_AA,
+        )
+        if self.behavior_phase == 'CAR_FOLLOW' or self.car_follow_lane_debug != 'off':
+            text9 = f'car_follow_lane: {self.car_follow_lane_debug}'
+            cv.putText(
+                result, text9, (30, 320), cv.FONT_HERSHEY_SIMPLEX, 0.65,
+                (255, 180, 80), 2, cv.LINE_AA,
+            )
 
         return result
 

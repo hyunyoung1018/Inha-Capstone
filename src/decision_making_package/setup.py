@@ -26,6 +26,9 @@ setup(
         'console_scripts': [
             'stanley_follow = decision_making_package.stanley_follow:main',
             'state_machine = decision_making_package.state_machine_node:main',
+            'state_machine_cone = decision_making_package.state_machine_cone_node:main',
+            'test_state_machine = decision_making_package.test_state_machine:main',
+            'my_test_stanley = decision_making_package.my_test_stanley:main',
         ],
     },
 )
